@@ -1,0 +1,31 @@
+/* Tailwind Directives */
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* Add custom styles within Tailwind layers */
+@layer utilities {
+  /* Confetti Styles */
+  .confetti {
+    width: 10px; /* Base size */
+    height: 10px;
+    border-radius: 50%;
+    position: absolute; /* Positioned relative to nearest positioned ancestor */
+    pointer-events: none; /* Prevent interaction */
+    animation: confetti-fall linear forwards; /* Animation name and properties */
+    z-index: 100; /* Ensure visibility */
+    /* Dynamic styles like left, top, background-color, animation-duration set via JS */
+  }
+
+  @keyframes confetti-fall {
+    0% {
+      transform: translateY(0) rotate(0deg);
+      opacity: 1;
+    }
+    100% {
+      /* Fall slightly further than container height */
+      transform: translateY(calc(100vh + 50px)) rotate(720deg);
+      opacity: 0;
+    }
+  }
+} /* End of @layer utilities */
