@@ -12,6 +12,7 @@ import axios from 'axios'; // Import axios for making API calls (Run: npm instal
 const APP_NAME = "TaskCircuit";
 // Define the base URL for the backend API (Ensure matches backend port)
 const API_BASE_URL = import.meta.env.VITE_API_URL || 'http://localhost:3001/api';
+const REMINDER_POLL_INTERVAL = 60000; // Check every 60 seconds
 
 // --- Axios API Client Setup ---
 const apiClient = axios.create({
@@ -37,8 +38,26 @@ const setAuthToken = (token) => {
 
 // --- Types --- (Keep interfaces for reference, but they aren't enforced in JS)
 /*
-interface Task { ... }
-interface Board { ... }
+interface Task {
+  id: string;
+  title: string;
+  description?: string | null;
+  status: 'todo' | 'inprogress' | 'done';
+  startDate?: string | null; // Assuming ISO string format
+  estimatedFinishDate?: string | null;
+  reminderDateTime?: string | null;
+  progress: number;
+  createdAt: string;
+  updatedAt: string;
+  boardId: string;
+}
+interface Board {
+  id: string;
+  name: string;
+  createdAt: string;
+  updatedAt: string;
+  userId: string;
+}
 */
 
 // --- Helper Functions ---
@@ -68,8 +87,22 @@ const buttonStyles = {
 
 const ReminderNotification = ({ message, onClose }) => {
     useEffect(() => { const timer = setTimeout(onClose, 5000); return () => clearTimeout(timer); }, [onClose]);
-    if (!motion) return null;
-    return ( <motion.div initial={{ opacity: 0, y: -20 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: -10 }} className="fixed top-4 right-4 z-[100] bg-yellow-400 text-yellow-900 p-3 rounded-md shadow-lg flex items-center gap-2 border border-yellow-500"> <Bell className="w-5 h-5" /> <span className="text-sm font-medium">{message}</span> <button onClick={onClose} className={`${buttonStyles.ghost} text-yellow-900 hover:bg-yellow-500/50`}><X className="w-4 h-4" /></button> </motion.div> );
+    // Ensure motion is available before rendering
+    if (typeof motion === 'undefined') return null;
+    return (
+        <motion.div
+            initial={{ opacity: 0, y: -20 }}
+            animate={{ opacity: 1, y: 0 }}
+            exit={{ opacity: 0, y: -10 }}
+            className="fixed top-4 right-4 z-[100] bg-yellow-400 text-yellow-900 p-3 rounded-md shadow-lg flex items-center gap-2 border border-yellow-500"
+        >
+            <Bell className="w-5 h-5" />
+            <span className="text-sm font-medium">{message}</span>
+            <button onClick={onClose} className={`${buttonStyles.ghost} text-yellow-900 hover:bg-yellow-500/50`}>
+                <X className="w-4 h-4" />
+            </button>
+        </motion.div>
+     );
 };
 
 // Updated TaskCard with improved custom progress bar logic
@@ -233,7 +266,10 @@ const KanbanBoardView = ({ board, onNavigateBack }) => {
     const containerRef = useRef(null);
     const [isModalOpen, setIsModalOpen] = useState(false);
     const [draggingOverColumn, setDraggingOverColumn] = useState(null);
-    const [activeReminder, setActiveReminder] = useState(null);
+    // State for the currently displayed reminder notification
+    const [activeReminder, setActiveReminder] = useState(null); // { id: string, message: string } | null
+    // State to track reminders already shown/dismissed in this session
+    const [dismissedReminders, setDismissedReminders] = useState(new Set());
 
     const fetchTasks = useCallback(async () => {
         if (!board?.id) return;
@@ -255,6 +291,54 @@ const KanbanBoardView = ({ board, onNavigateBack }) => {
     useEffect(() => {
         fetchTasks();
     }, [fetchTasks]);
+
+    // --- Reminder Polling Logic ---
+    useEffect(() => {
+        const checkReminders = () => {
+            // Don't show a new reminder if one is already active
+            if (activeReminder) return;
+
+            const now = new Date();
+            let foundReminder = null;
+
+            for (const task of tasks) {
+                if (task.reminderDateTime && task.status !== 'done' && !dismissedReminders.has(task.id)) {
+                    try {
+                        const reminderTime = new Date(task.reminderDateTime);
+                        if (reminderTime <= now) {
+                            foundReminder = task;
+                            break; // Found the first past-due, non-dismissed reminder
+                        }
+                    } catch (e) {
+                        console.error("Error parsing reminder date for task", task.id, task.reminderDateTime, e);
+                        // Optionally mark as dismissed to avoid repeated errors?
+                        // setDismissedReminders(prev => new Set(prev).add(task.id));
+                    }
+                }
+            }
+
+            if (foundReminder) {
+                console.log("Reminder triggered for task:", foundReminder.title);
+                setActiveReminder({
+                    id: foundReminder.id,
+                    message: `Reminder: ${foundReminder.title}`
+                });
+                // Mark as dismissed for this session
+                setDismissedReminders(prev => new Set(prev).add(foundReminder.id));
+            }
+        };
+
+        // Check immediately on load and then set interval
+        checkReminders();
+        const intervalId = setInterval(checkReminders, REMINDER_POLL_INTERVAL);
+
+        // Cleanup interval on component unmount
+        return () => clearInterval(intervalId);
+
+    // Rerun effect if tasks change, or activeReminder is dismissed
+    }, [tasks, activeReminder, dismissedReminders]);
+    // --- End Reminder Polling Logic ---
+
 
     const handleApiAddTask = async (newTaskData) => {
          if (!board?.id) return;
@@ -289,27 +373,18 @@ const KanbanBoardView = ({ board, onNavigateBack }) => {
          console.log(`Updating task ${taskId}:`, finalUpdates);
 
          try {
-             // Apply optimistic update locally before API call
+             // Optimistic update
              let taskUpdatedLocally = false;
              setTasks(currentTasks => currentTasks.map(t => {
                  if (t.id === taskId) {
                      taskUpdatedLocally = true;
-                     // Ensure progress rule is applied visually immediately if status changes
-                     let optimisticProgress = t.progress;
-                     if (isStatusChange) {
-                         if (finalUpdates.status === 'done') optimisticProgress = 100;
-                         else if (finalUpdates.status === 'todo') optimisticProgress = 0;
-                         else if (finalUpdates.status === 'inprogress') optimisticProgress = finalUpdates.progress ?? 25;
-                     } else if (finalUpdates.progress !== undefined) {
-                         optimisticProgress = finalUpdates.progress;
-                     }
-                     return { ...t, ...finalUpdates, progress: optimisticProgress };
+                     return { ...t, ...finalUpdates };
                  }
                  return t;
              }));
 
-             if (!taskUpdatedLocally && isStatusChange) {
-                console.warn("Optimistic update skipped: Task ID not found for status change.");
+             if (!taskUpdatedLocally) {
+                console.warn("Optimistic update may have failed: Task ID not found.");
              }
 
              await apiClient.put(`/tasks/${taskId}`, finalUpdates);
@@ -318,12 +393,11 @@ const KanbanBoardView = ({ board, onNavigateBack }) => {
                  console.log("Triggering confetti!");
                  generateConfetti(60, containerRef.current);
              }
-             // No refetch needed if optimistic update is sufficient
 
          } catch (err) {
              console.error("Update task failed:", err.response?.data || err.message);
              setTaskError(err.response?.data?.message || "Failed to update task.");
-             fetchTasks(); // Rollback on error by refetching all tasks
+             fetchTasks(); // Rollback on error
          }
      };
 
@@ -332,13 +406,12 @@ const KanbanBoardView = ({ board, onNavigateBack }) => {
          console.log(`Deleting task ${taskId}`);
          if (window.confirm("Are you sure you want to delete this task?")) {
              try {
-                 // Optimistic delete
                  setTasks(currentTasks => currentTasks.filter(t => t.id !== taskId));
                  await apiClient.delete(`/tasks/${taskId}`);
              } catch (err) {
                  console.error("Delete task failed:", err.response?.data || err.message);
                  setTaskError(err.response?.data?.message || "Failed to delete task.");
-                 fetchTasks(); // Rollback on error
+                 fetchTasks(); // Rollback
              }
          }
      };
@@ -384,11 +457,9 @@ const KanbanBoardView = ({ board, onNavigateBack }) => {
                             onDragOver={(e) => handleDragOver(e, status)} onDragLeave={handleDragLeave} onDrop={(e) => handleDrop(e, status)}>
                             <h2 className="text-lg font-semibold text-gray-800 dark:text-gray-200 mb-4 pb-2 border-b border-gray-300 dark:border-gray-600 capitalize"> {KANBAN_TITLES[status]} ({tasks.filter(t => t.status === status).length}) </h2>
                             <div className="space-y-4">
-                                {/* Removed AnimatePresence and motion props from wrapper div */}
+                                {/* Map tasks without extra motion/presence wrappers */}
                                 {tasks.filter((task) => task.status === status).map((task) => (
-                                    // Simple div wrapper, key is essential
                                     <div key={task.id}>
-                                        {/* Pass drag handlers down to TaskCard */}
                                         <TaskCard
                                             task={task}
                                             onDelete={handleApiDeleteTask}
@@ -405,8 +476,16 @@ const KanbanBoardView = ({ board, onNavigateBack }) => {
                 </div>
             )}
              <AddTaskModal isOpen={isModalOpen} onClose={() => setIsModalOpen(false)} onAdd={handleApiAddTask} />
-             {/* Ensure AnimatePresence wraps ReminderNotification if used */}
-             <AnimatePresence>{activeReminder && (<ReminderNotification key={activeReminder.id} message={activeReminder.message} onClose={() => setActiveReminder(null)} />)}</AnimatePresence>
+             {/* Render active reminder using AnimatePresence */}
+             <AnimatePresence>
+                {activeReminder && (
+                    <ReminderNotification
+                        key={activeReminder.id} // Use task ID as key
+                        message={activeReminder.message}
+                        onClose={() => setActiveReminder(null)} // Simply hide it
+                    />
+                )}
+            </AnimatePresence>
         </div>
     );
 };
@@ -426,13 +505,13 @@ const AuthPage = ({ onAuthSuccess, initialError = '' }) => {
 
     const handleSwitchMode = () => {
         setIsLogin(!isLogin);
-        setError(''); // Clear errors when switching modes
+        setError('');
     };
 
 
     const handleSubmit = async (e) => {
         e.preventDefault();
-        setError(''); // Clear previous errors
+        setError('');
         if (!isLogin && password !== confirmPassword) {
              setError("Passwords do not match.");
              return;
@@ -447,7 +526,7 @@ const AuthPage = ({ onAuthSuccess, initialError = '' }) => {
                 onAuthSuccess(response.data.token);
             } else {
                  alert("Signup successful! Please log in.");
-                 setIsLogin(true); // Switch to login view after successful signup
+                 setIsLogin(true);
                  setEmail('');
                  setPassword('');
                  setConfirmPassword('');
@@ -469,7 +548,7 @@ const AuthPage = ({ onAuthSuccess, initialError = '' }) => {
         <div className="flex flex-col items-center justify-center min-h-screen bg-gradient-to-br from-indigo-100 via-white to-sky-100 dark:from-indigo-950 dark:via-gray-900 dark:to-sky-950 p-4">
             <motion.div initial={{ opacity: 0, y: -30 }} animate={{ opacity: 1, y: 0 }} transition={{ duration: 0.6, type: 'spring' }} className="w-full max-w-md bg-white dark:bg-gray-800 p-8 rounded-xl shadow-2xl border border-gray-200 dark:border-gray-700">
                  <div className="text-center mb-8"> <ListChecks className="w-12 h-12 mx-auto text-blue-600 dark:text-blue-500 mb-4" /> <h1 className="text-3xl font-bold text-gray-900 dark:text-white">{APP_NAME}</h1>
-                 <p className="text-gray-600 dark:text-gray-400 mt-2 leading-relaxed"> Welcome! Manage projects effortlessly with user-friendly boards. </p>
+                 <p className="text-gray-600 dark:text-gray-400 mt-2 leading-relaxed"> Welcome! Manage projects effortlessly with <div>user-friendly boards.</div> </p>
                  </div>
                  <h2 className="text-2xl font-semibold text-center mb-6 text-gray-800 dark:text-gray-200">{isLogin ? 'Login' : 'Sign Up'}</h2>
                  {error && <p className="text-sm text-red-500 text-center mb-4">{error}</p>}
@@ -494,7 +573,7 @@ const AuthPage = ({ onAuthSuccess, initialError = '' }) => {
                             </p>
                         </>
                      )}
-                     <button type="submit" disabled={isLoading} className={`${buttonStyles.primary} w-full text-base pt-3`}> {/* Added pt-3 for spacing */}
+                     <button type="submit" disabled={isLoading} className={`${buttonStyles.primary} w-full text-base pt-3`}>
                         {isLoading ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : (isLogin ? <LogIn className="mr-2 h-4 w-4" /> : <UserPlus className="mr-2 h-4 w-4" />)} {isLogin ? 'Login' : 'Sign Up'}
                      </button>
                  </form>
@@ -596,20 +675,19 @@ const App = () => {
             const token = params.get('token');
             const error = params.get('error');
 
-            // Clean the URL immediately
-            window.history.replaceState({}, document.title, "/");
+            window.history.replaceState({}, document.title, "/"); // Clean URL immediately
 
             if (token) {
                 console.log("Auth callback successful, token received.");
                 handleAuthSuccess(token);
-                // Let state update trigger navigation
+                // State update will trigger re-render and show correct page
             } else if (error) {
                 console.error("Auth callback error:", error);
                 setAuthCallbackError("Google authentication failed. Please try again.");
                 setIsAuthenticated(false);
                 setCurrentPage('auth');
             }
-             setAuthLoading(false);
+             setAuthLoading(false); // Finish loading check
         }
 
         if (window.location.pathname === '/auth/callback') {
@@ -631,13 +709,13 @@ const App = () => {
               setAuthLoading(false);
         }
 
-    }, []);
+    }, []); // Run only once
 
     const handleAuthSuccess = (token) => {
         console.log("Handling Auth Success");
         setAuthToken(token);
         setIsAuthenticated(true);
-        setCurrentPage('dashboard'); // Explicitly navigate on success
+        setCurrentPage('dashboard'); // Ensure navigation on success
         setCurrentBoardId(null);
         setAuthCallbackError('');
     };
@@ -656,17 +734,15 @@ const App = () => {
 
     let pageComponent;
      if (!isAuthenticated) {
-        // Pass error state down to AuthPage
         pageComponent = <AuthPage key="auth" onAuthSuccess={handleAuthSuccess} initialError={authCallbackError} />;
     } else {
-        // User is authenticated
         switch (currentPage) {
             case 'dashboard':
                 pageComponent = <DashboardPage key="dashboard" onBoardSelect={navigateToBoard} onLogout={handleLogout} />;
                 break;
             case 'board':
                 if (currentBoardId) {
-                     const boardData = { id: currentBoardId, name: "Board" };
+                     const boardData = { id: currentBoardId, name: "Board" }; // Placeholder
                      pageComponent = <KanbanBoardView key="boardview" board={boardData} onNavigateBack={navigateToDashboard} />;
                 } else {
                      console.warn("In 'board' state but no currentBoardId found. Redirecting to dashboard.");
